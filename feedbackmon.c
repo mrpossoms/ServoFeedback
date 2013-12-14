@@ -15,6 +15,10 @@
 #define SAMPLES 100
 #define SERVOS 8
 
+typedef struct{
+	short Servos[8];
+} StateMsg;
+
 pthread_t RXthread, TXthread;
 float* servoSamples[SERVOS];
 KalmanFilter servoFilters[SERVOS];
@@ -22,13 +26,18 @@ KalmanFilter servoFilters[SERVOS];
 int USB;
 int currentSample[SERVOS], currentServo = 0;
 
+StateMsg machineState, currentState;
+
 float transformSample(int sample){
 	return (sample * 2 / 1024.0f) - 1.0f;
 }
 
+int rxStart = 0;
+
 int oscillating = 0;
 float oscTime = 0;
 void* serialTX(void* params){
+	int i = 0;
 	while(1){
 		int servo = -1, value = -1;
 		char buf0[128], buf1[128];
@@ -37,15 +46,12 @@ void* serialTX(void* params){
 			char command[128];
 			oscTime += 0.016f;
 			int angle = 10 + (int)(50 * (cos(oscTime) + 1) / 2.0f);
-			sprintf(
-				command,
-				"1\r\n%d\r\n2\r\n%d\r\n3\r\n%d\r\n4\r\n%d\r\n",
-				angle, angle, angle, angle
-			);
+			for(i = 0; i < 4; i++)
+				machineState.Servos[i] = angle;
+
 			printf("%d\n", angle);
-			serialport_write(USB, command);
-			serialport_flush(USB);
-			usleep(60000);
+			TxMsg(&machineState, sizeof(StateMsg));
+
 			continue;
 		}
 
@@ -54,32 +60,34 @@ void* serialTX(void* params){
 			printf("Value: "); scanf("%d", &value);
 			if(value >= 0 && value <= 180){
 				// send
-				sprintf(buf0, "%d\r\n", servo);
-				serialport_write(USB, buf0); // select servo
-				printf("%s\n", buf0);
+				StateMsg msg = {
+					{90,90,90,90,90,90,90,90}
+				};
 
-				sprintf(buf1, "%d\r\n", value);
-				serialport_write(USB, buf1); // write value
-				printf("%s\n", buf1);
-				serialport_flush(USB);
+				msg.Servos[servo] = value;
+				TxMsg(&msg, sizeof(StateMsg));
+				//serialport_flush(USB);
 			}
+			rxStart = 1;
 		}
 		else if(servo == -1){
-			serialport_write(USB, "1\r\n90\r\n2\r\n90\r\n3\r\n90\r\n4\r\n90\r\n");
+			StateMsg stand = {
+				{0,0,0, (short)random(), 0,0,0,0}
+			};
+
+			TxMsg(&stand, sizeof(StateMsg));
+			rxStart = 1;
 		}
 		else if(servo == -2){
 			serialport_write(USB, "1\r\n50\r\n2\r\n50\r\n3\r\n50\r\n4\r\n50\r\n");
 		}
 		else if(servo == -3){
 			char command[128];
-			int value;
+			int value, i;
+
 			printf("Value: "); scanf("%d", &value);
-			sprintf(
-				command,
-				"5\r\n%d\r\n6\r\n%d\r\n7\r\n%d\r\n8\r\n%d\r\n",
-				value, value, value, value
-			);
-			serialport_write(USB, command);
+			for(i = SERVOS; i--; machineState.Servos[i] = value);
+			TxMsg(&machineState, sizeof(StateMsg));
 		}
 		else if(servo == -4) oscillating = 1;
 	}
@@ -90,22 +98,22 @@ void* serialRX(void* params){
 	float dt = 0.016f;
 
 	while(1){
-		int i = -1;
-		serialport_read_until(USB, buf, '\n', 1024, 10);
+		int i = -1,rx = 0;
+		if(rxStart)
+		if((rx = RxMsg(&currentState, sizeof(StateMsg))) > 0){
 		//printf("-----------------------\n");
-		sscanf(buf, "%d", &i);
-		if(i >= 0){
-			if(i < 8){
-				currentServo = i;
+			for(i = 0; i < SERVOS; i++){
+					//printf("%d -> %d\n", currentServo, i);
+					float samp = Update(&servoFilters[i], transformSample(currentState.Servos[i]), dt);
+					servoSamples[i][currentSample[i]] = samp;
+					++currentSample[i];
+					currentSample[i] %= SAMPLES;
+					printf("%d ", (int)currentState.Servos[i]);
 			}
-			else{
-				//printf("%d -> %d\n", currentServo, i);
-				float samp = Update(&servoFilters[currentServo], transformSample(i), dt);
-				servoSamples[currentServo][currentSample[currentServo]] = samp;
-				++currentSample[currentServo];
-				currentSample[currentServo] %= SAMPLES;
-			}
+			printf("\n");
 		}
+		//else
+		//	printf("Failed to read... %d\n", rx);
 	}	
 }
 
@@ -172,14 +180,8 @@ int main(int argc, char *argv[] ){
 	glutCreateWindow( "OpenGL example" ); 
 
 	// setup serial comms
-	USB = serialport_init("/dev/serial/by-id/usb-Arduino__www.arduino.cc__Arduino_Uno_6493832333135180F002-if00", 9600);
-	if(USB){
-		printf("Connected!\n");
-		serialport_flush(USB);
-		// serialport_write(USB, "0");
-		// serialport_write(USB, "20");
-	}
-	else
+	if(!OpenCom("/dev/serial/by-id/usb-Arduino__www.arduino.cc__Arduino_Uno_6493832333135180F002-if00", 9600))
+	//if(!OpenCom("/dev/serial/by-id/usb-Arduino__www.arduino.cc__0043_85231363236351810222-if00", 9600))
 		return;
 
 	// allocate sample space
@@ -193,6 +195,8 @@ int main(int argc, char *argv[] ){
 			1.0f,
 			0.5f, 1
 		);
+
+		machineState.Servos[i] = 60;
 	}
 
 	pthread_create(
