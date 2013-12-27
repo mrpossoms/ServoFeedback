@@ -6,27 +6,22 @@
 #include <pthread.h>
 
 #include "arduino-serial-lib.h"
-#include "filtering.h"
+#include "FeedBackLib/feedbacklib.h"
 
 #include <GL/glew.h>
 #include <GL/freeglut.h>
 #include <GL/freeglut_ext.h>
 
-#define SAMPLES 100
+#define SAMPLES RAW_SAMPLE_COUNT 
 #define SERVOS 8
 
 typedef struct{
 	short Angle[SERVOS];
 } ServoStates;
 
+Servo Servos[SERVOS];
 pthread_t RXthread, TXthread;
-float* rawServoSamples[SERVOS];
-float* servoSamples[SERVOS];
-KalmanFilter servoFilters[SERVOS];
-
 int USB;
-int currentSample[SERVOS], currentServo = 0;
-int overloaded[SERVOS] = {0};
 
 float transformSample(int sample){
 	return (sample * 2 / 1024.0f) - 1.0f;
@@ -64,12 +59,7 @@ int WriteTX(ServoStates* st){
 	return serialport_write(USB, buf);
 }
 
-ServoStates txState = {
-	{
-		60, 60, 60, 60,
-		60, 60, 60, 60
-	}
-};
+ServoStates txState;
 void* serialTX(void* params){
 	while(1){
 		int servo = -1, value = -1;
@@ -81,10 +71,10 @@ void* serialTX(void* params){
 			int angle = 10 + (int)(50 * (cos(oscTime) + 1) / 2.0f);
 
 			for(i = 4; i--;){
-				if(overloaded[i]){
-					txState.Angle[i] = 10;
-					continue;
-				}
+				//if(overloaded[i]){
+				//	txState.Angle[i] = 10;
+				//	continue;
+				//}
 				txState.Angle[i] = angle;
 			}
 
@@ -144,35 +134,10 @@ void* serialRX(void* params){
 		int i = -1;
 		if(ReadRX(&state)){
 			for(i = 0; i < 8; i++){
-				int j = 0;
-				int sampInd = currentSample[i];
-				float var = 0;
-				float samp = Update(
-					&servoFilters[i],
-					rawServoSamples[i][sampInd] = transformSample(state.Angle[i]),
-					dt
-				);
-				servoSamples[i][sampInd] = samp;
-				++currentSample[i];
-				currentSample[i] %= SAMPLES;
-
-				// determine variance
-				for(j = 0; j < 20; j++){
-					int ind = sampInd - j < 0 ? sampInd - j + SAMPLES : sampInd - j;
-					float raw = rawServoSamples[i][ind];
-					float flt = servoSamples[i][ind];
-
-					register float term = raw - flt;
-					var += term * term;
-				}
-				var *= 1/20.0f;
-
-				if(var < 0.0006f) started = 1;
-				if(var >= 0.0006f && started) overloaded[i] = 1;//!overloaded[i];
-
-				printf("%+f ", var);
+				fbUpdate(Servos + i, transformSample(state.Angle[i]));
+				//printf("%d ", state.Angle[i]);
 			}
-			printf("\n");
+			//printf("\n");
 		}
 	}	
 }
@@ -212,12 +177,12 @@ void display( void ){
 		0, 0, 0.5f,
 		0.5f, 0.5f, 0
 	};
-	float x = currentSample[0] * (2.0f / SAMPLES) - 1.0f;
+	float x = Servos[0].CurrentIndex * (2.0f / SAMPLES) - 1.0f;
 	int i = SERVOS;
 	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 
 	for(;i--;)
-		drawSamples(servoSamples[i], colors + i * 3);
+		drawSamples(Servos[i].filter.Samples, colors + i * 3);
 
 	glBegin(GL_LINES);
 	glColor3f(1, 1, 1);
@@ -231,9 +196,16 @@ void display( void ){
 	glutPostRedisplay();
 }
 
+void impactResponse(Servo* servo, float var){
+	if(var - servo->stats.LastVar > 0.00005f){
+		unsigned int diff = (unsigned int)(servo - Servos);
+		printf("%u impacted %f - %f\n", diff, servo->stats.LastVar, var);
+	}
+}
+
 int main(int argc, char *argv[] ){
 	int i, j;
-
+printf("samples: %d\n", SAMPLES);
 	glutInit( &argc, argv ); 
 	glutInitDisplayMode( GLUT_RGBA | GLUT_DEPTH ); 
 	glutInitWindowSize( 512, 512 ); 
@@ -253,17 +225,10 @@ int main(int argc, char *argv[] ){
 
 	// allocate sample space
 	for(i = SERVOS; i--;){
-		servoSamples[i] = (float*)malloc(sizeof(float) * SAMPLES);
-		rawServoSamples[i] = (float*)malloc(sizeof(float) * SAMPLES);
-
-		bzero(servoSamples[i], sizeof(float) * SAMPLES);
-		bzero(rawServoSamples[i], sizeof(float) * SAMPLES);
-		bzero(&servoFilters[i], sizeof(KalmanFilter));
-
-		Reset(&servoFilters[i],
-			0.5f, 0.5f,
-			1.0f,
-			0.5f, 1
+		Servos[i] = fbGenServo(
+			impactResponse,
+			30,     // angle
+			3.00f    // variance coefficent
 		);
 	}
 
